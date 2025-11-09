@@ -7,7 +7,6 @@ import qrcode
 from io import BytesIO
 from datetime import datetime
 import uuid
-from google.cloud import storage
 import tempfile
 
 load_dotenv()
@@ -23,7 +22,7 @@ app.secret_key = APP_SECRET
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 
 DB_URL = "sqlite:///data.db"
-engine = create_engine(DB_URL, echo=False)
+engine = create_engine(DB_URL, echo=False, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -66,24 +65,34 @@ def admin_required(f):
     return wrapper
 
 def get_storage_client():
-    if not (FIREBASE_BUCKET and FIREBASE_CREDENTIALS_JSON):
+    try:
+        if not (FIREBASE_BUCKET and FIREBASE_CREDENTIALS_JSON):
+            return None
+        from google.cloud import storage
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp.write(FIREBASE_CREDENTIALS_JSON.encode("utf-8"))
+        tmp.flush()
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
+        return storage.Client(project=FIREBASE_PROJECT_ID)
+    except Exception as e:
+        app.logger.exception("Firebase disabled due to error: %s", e)
         return None
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp.write(FIREBASE_CREDENTIALS_JSON.encode("utf-8"))
-    tmp.flush()
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp.name
-    return storage.Client(project=FIREBASE_PROJECT_ID)
 
 def upload_to_firebase(file_storage, folder="uploads"):
-    client = get_storage_client()
-    if not client: return None
-    bucket = client.bucket(FIREBASE_BUCKET)
-    ext = os.path.splitext(file_storage.filename or "")[1].lower()
-    key = f"{folder}/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4().hex}{ext}"
-    blob = bucket.blob(key)
-    blob.upload_from_file(file_storage.stream, content_type=file_storage.mimetype)
-    blob.make_public()
-    return blob.public_url
+    try:
+        client = get_storage_client()
+        if not client:
+            return None
+        bucket = client.bucket(FIREBASE_BUCKET)
+        ext = os.path.splitext(file_storage.filename or "")[1].lower()
+        key = f"{folder}/{datetime.utcnow().strftime('%Y/%m/%d')}/{uuid.uuid4().hex}{ext}"
+        blob = bucket.blob(key)
+        blob.upload_from_file(file_storage.stream, content_type=file_storage.mimetype)
+        blob.make_public()
+        return blob.public_url
+    except Exception as e:
+        app.logger.exception("Firebase upload failed: %s", e)
+        return None
 
 def get_base_url():
     b = BASE_URL or ""
@@ -246,27 +255,19 @@ def vcard(slug):
         for w in [x.strip() for x in ag.websites.split(",") if x.strip()]:
             lines.append(f"URL:{w}")
     if getattr(ag, "company", None): lines.append(f"ORG:{ag.company}")
-
-    # Custom fields for business identifiers
-    if getattr(ag, "piva", None):
-        lines.append(f"X-TAX-ID:{ag.piva}")
-    if getattr(ag, "sdi", None):
-        lines.append(f"X-SDI-CODE:{ag.sdi}")
-    # Also include a NOTE line for compatibility
+    if getattr(ag, "piva", None): lines.append(f"X-TAX-ID:{ag.piva}")
+    if getattr(ag, "sdi", None): lines.append(f"X-SDI-CODE:{ag.sdi}")
     note_parts = []
     if getattr(ag, "piva", None): note_parts.append(f"Partita IVA: {ag.piva}")
     if getattr(ag, "sdi", None): note_parts.append(f"SDI: {ag.sdi}")
     if note_parts:
         lines.append("NOTE:" + " | ".join(note_parts))
-
     lines.append("END:VCARD")
     content = "\r\n".join(lines)
-
     if request.args.get("download") == "1":
         resp = Response(content, mimetype="text/vcard; charset=utf-8")
         resp.headers["Content-Disposition"] = f'attachment; filename="{ag.slug}.vcf"'
         return resp
-
     return Response(content, mimetype="text/vcard; charset=utf-8")
 
 @app.get("/<slug>/qr.png")
